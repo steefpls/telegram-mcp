@@ -23,6 +23,17 @@ class ClaudeResult:
     resumed: bool = False
 
 
+# Isolated CWD for spawned Claude — so stray files Claude writes during a
+# turn (haikus, scratch notes, generated png) don't pollute the daemon's
+# working directory or the repo root. Created lazily on first run.
+_CLAUDE_WORK_DIR = "data/claude-work"
+
+
+def _ensure_work_dir() -> str:
+    os.makedirs(_CLAUDE_WORK_DIR, exist_ok=True)
+    return _CLAUDE_WORK_DIR
+
+
 def _make_mcp_config(port: int, api_key: str) -> str:
     cfg = {
         "mcpServers": {
@@ -85,6 +96,7 @@ async def run_claude(
     )
 
     proc = None
+    work_dir = _ensure_work_dir()
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -92,6 +104,7 @@ async def run_claude(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=creationflags,
+            cwd=work_dir,
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(

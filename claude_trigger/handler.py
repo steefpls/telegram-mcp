@@ -5,8 +5,11 @@ from datetime import datetime, timezone
 
 from telethon import events
 from telethon.tl.custom import Message
-from telethon.tl.functions.messages import GetMessageReactionsListRequest
-from telethon.tl.types import MessageReplyHeader
+from telethon.tl.functions.messages import (
+    GetMessageReactionsListRequest,
+    SendReactionRequest,
+)
+from telethon.tl.types import MessageReplyHeader, ReactionEmoji
 
 from .config import TriggerConfig
 from .locks import ChatLockManager
@@ -77,6 +80,7 @@ async def _gather_history(
     chat_id: int,
     limit: int,
     owner_id: int,
+    owner_name: str = "Steve",
     media_store: MediaStore | None = None,
     message_store: MessageStore | None = None,
     reaction_cache: ReactionCacheStore | None = None,
@@ -100,7 +104,7 @@ async def _gather_history(
     # message senders, reactors, and quote-reply parents.
     name_cache: dict[int, str] = {0: "Unknown"}
     if owner_id:
-        name_cache[owner_id] = "Steve"
+        name_cache[owner_id] = owner_name
 
     async def name_for(uid: int) -> str:
         if uid in name_cache:
@@ -461,16 +465,56 @@ async def _process_trigger(
     chat_id: int,
     sender_id: int,
 ) -> None:
+    # Reaction ack: instant visual signal on the trigger message itself,
+    # before the thinking text-message lands. Cleared on completion (or
+    # pipeline crash) so it disappears once Claude is done. We try 👀 first
+    # (mirrors whatsapp-mcp), fall back to 🤔 if Telegram demands Premium
+    # for that emoji in this chat — 🤔 is in the universal free-tier set.
+    set_reaction: str | None = None
+    for candidate in ("👀", "🤔"):
+        try:
+            await client(
+                SendReactionRequest(
+                    peer=chat_id,
+                    msg_id=msg.id,
+                    reaction=[ReactionEmoji(emoticon=candidate)],
+                )
+            )
+            set_reaction = candidate
+            break
+        except Exception as e:
+            print(
+                f"[CLAUDE] Failed to set {candidate} reaction on msg {msg.id} "
+                f"in chat {chat_id}: {e!r}",
+                file=sys.stderr,
+            )
+
+    async def _clear_reaction() -> None:
+        if set_reaction is None:
+            return
+        try:
+            await client(
+                SendReactionRequest(peer=chat_id, msg_id=msg.id, reaction=[])
+            )
+        except Exception as e:
+            print(
+                f"[CLAUDE] Failed to clear {set_reaction} reaction on msg "
+                f"{msg.id} in chat {chat_id}: {e!r}",
+                file=sys.stderr,
+            )
+
     # Send thinking ack as a reply to the trigger message
     try:
         ack = await client.send_message(chat_id, random_thinking(), reply_to=msg.id)
     except Exception as e:
         print(f"[CLAUDE] Failed to send ack to chat {chat_id}: {e!r}", file=sys.stderr)
         logger.exception("Failed to send thinking ack")
+        await _clear_reaction()
         return
 
     try:
         gather_kwargs = dict(
+            owner_name=cfg.owner_name,
             media_store=media,
             message_store=messages,
             reaction_cache=reactions,
@@ -512,7 +556,7 @@ async def _process_trigger(
         chat_name = await _resolve_chat_name(client, chat_id)
         requester_is_owner = sender_id == cfg.owner_user_id
         requester_name = (
-            "Steve" if requester_is_owner else await _resolve_sender_name(client, sender_id)
+            cfg.owner_name if requester_is_owner else await _resolve_sender_name(client, sender_id)
         )
 
         # --- Resume vs new-session vs compact decision ------------------
@@ -559,6 +603,7 @@ async def _process_trigger(
             messages=history,
             latest_text=msg.text or "",
             memory_vault=cfg.memory_vault,
+            owner_name=cfg.owner_name,
         )
 
         compacted_now = False
@@ -607,6 +652,7 @@ async def _process_trigger(
                     messages=history,
                     latest_text=msg.text or "",
                     memory_vault=cfg.memory_vault,
+                    owner_name=cfg.owner_name,
                 )
                 resume_session_id = ""  # fresh session
                 compacted_now = True
@@ -645,6 +691,7 @@ async def _process_trigger(
                 requester_is_owner=requester_is_owner,
                 new_messages=new_messages,
                 latest_text=msg.text or "",
+                owner_name=cfg.owner_name,
             )
             resume_session_id = existing.session_id
             print(
@@ -734,6 +781,8 @@ async def _process_trigger(
             )
         except Exception:
             pass
+    finally:
+        await _clear_reaction()
 
 
 def register(

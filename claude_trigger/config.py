@@ -44,6 +44,7 @@ class TriggerConfig:
     mcp_port: int
     mcp_api_key: str
     owner_user_id: int
+    owner_name: str
     memory_vault: str
     history_messages: int
     db_path: str
@@ -86,6 +87,7 @@ class TriggerConfig:
             mcp_port=int(os.getenv("MCP_PORT", "8081")),
             mcp_api_key=api_key,
             owner_user_id=int(owner),
+            owner_name=os.getenv("OWNER_NAME", "Steve").strip() or "Steve",
             memory_vault=os.getenv("MEMORY_VAULT", "").strip(),
             history_messages=int(os.getenv("CLAUDE_HISTORY_MESSAGES", "40")),
             db_path=os.getenv("CLAUDE_TRIGGER_DB_PATH", "data/telegram_mcp.db").strip(),
