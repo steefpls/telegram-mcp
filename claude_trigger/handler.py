@@ -123,10 +123,10 @@ async def _maybe_dispatch(
     sender_id = msg.sender_id
     is_owner = sender_id == cfg.owner_user_id
     if not is_owner and not trusted.is_trusted(sender_id or 0):
-        logger.info(
-            "Ignoring @claude from untrusted sender_id=%s (owner=%s)",
-            sender_id,
-            cfg.owner_user_id,
+        print(
+            f"[CLAUDE] Ignoring @claude from untrusted sender {sender_id} "
+            f"(owner={cfg.owner_user_id})",
+            file=sys.stderr,
         )
         return
 
@@ -147,7 +147,8 @@ async def _process_trigger(
     # Send thinking ack as a reply to the trigger message
     try:
         ack = await client.send_message(chat_id, random_thinking(), reply_to=msg.id)
-    except Exception:
+    except Exception as e:
+        print(f"[CLAUDE] Failed to send ack to chat {chat_id}: {e!r}", file=sys.stderr)
         logger.exception("Failed to send thinking ack")
         return
 
@@ -179,27 +180,44 @@ async def _process_trigger(
         # compact otherwise (a fresh session has no prior context to summarize),
         # and we gate on `just_compacted` so two compactions never run
         # back-to-back (the post-compact turn itself can be heavy).
-        should_compact = (
+        threshold_met = (
             can_resume
             and cfg.compact_threshold_tokens > 0
             and existing is not None
             and existing.last_input_tokens >= cfg.compact_threshold_tokens
-            and not existing.just_compacted
         )
+        if threshold_met and existing is not None and existing.just_compacted:
+            print(
+                f"[CLAUDE] Session {existing.session_id} for chat {chat_id} "
+                f"exceeded threshold ({existing.last_input_tokens} >= "
+                f"{cfg.compact_threshold_tokens}) but was just compacted last "
+                f"turn — skipping to avoid loop",
+                file=sys.stderr,
+            )
+        should_compact = threshold_met and existing is not None and not existing.just_compacted
 
         compacted_now = False
         if should_compact:
             assert existing is not None  # mypy/sanity — guaranteed by should_compact
+            print(
+                f"[CLAUDE] Session {existing.session_id} for chat {chat_id} "
+                f"exceeded threshold ({existing.last_input_tokens} >= "
+                f"{cfg.compact_threshold_tokens}), compacting",
+                file=sys.stderr,
+            )
             try:
                 await client.edit_message(
                     chat_id, ack.id, "🗜️ compacting context..."
                 )
-            except Exception:
-                logger.exception("Failed to edit ack to compacting state")
+            except Exception as e:
+                print(
+                    f"[CLAUDE] Failed to edit ack to compacting state: {e!r}",
+                    file=sys.stderr,
+                )
 
             print(
-                f"[@claude] compacting chat={chat_id} prior_tokens={existing.last_input_tokens} "
-                f"threshold={cfg.compact_threshold_tokens} session={existing.session_id}",
+                f"[CLAUDE] Compacting session {existing.session_id} "
+                f"using model={cfg.compact_model}",
                 file=sys.stderr,
             )
 
@@ -212,13 +230,6 @@ async def _process_trigger(
                 mcp_port=cfg.mcp_port,
                 mcp_api_key=cfg.mcp_api_key,
                 resume_session_id=existing.session_id,
-            )
-
-            print(
-                f"[@claude] compact-summary chat={chat_id} ok={summary_result.success} "
-                f"tokens={summary_result.total_tokens} cost=${summary_result.cost_usd:.4f} "
-                f"len={len(summary_result.text)}",
-                file=sys.stderr,
             )
 
             if summary_result.success and summary_result.text.strip():
@@ -234,15 +245,19 @@ async def _process_trigger(
                 )
                 resume_session_id = ""  # fresh session
                 compacted_now = True
-                mode = "compact"
+                print(
+                    f"[CLAUDE] Compaction successful for chat {chat_id} "
+                    f"(summary: {len(summary_result.text)} chars)",
+                    file=sys.stderr,
+                )
             else:
                 # Summary failed — fall back to a normal fresh session. The
                 # prior session may itself be broken; trying to resume it
                 # again here would just hit the same wall.
-                logger.warning(
-                    "Compaction summary failed (chat_id=%s err=%r); falling back to fresh session",
-                    chat_id,
-                    summary_result.error,
+                print(
+                    f"[CLAUDE] Compaction failed for chat {chat_id}, falling "
+                    f"back to fresh session without summary: {summary_result.error!r}",
+                    file=sys.stderr,
                 )
                 prompt = build_prompt(
                     chat_name=chat_name,
@@ -257,7 +272,6 @@ async def _process_trigger(
                 # failing summary on every subsequent turn — operator can
                 # clear the flag manually or wait for the next normal turn.
                 compacted_now = True
-                mode = "compact-fallback"
         elif can_resume:
             assert existing is not None
             # Strip messages the session already has, plus Claude's own
@@ -275,7 +289,12 @@ async def _process_trigger(
                 latest_text=msg.text or "",
             )
             resume_session_id = existing.session_id
-            mode = "resume"
+            print(
+                f"[CLAUDE] Resuming session {existing.session_id} for chat "
+                f"{chat_id} ({len(new_messages)} new messages, "
+                f"last_tokens={existing.last_input_tokens})",
+                file=sys.stderr,
+            )
         else:
             prompt = build_prompt(
                 chat_name=chat_name,
@@ -286,13 +305,11 @@ async def _process_trigger(
                 memory_vault=cfg.memory_vault,
             )
             resume_session_id = ""
-            mode = "new"
-
-        print(
-            f"[@claude] dispatch chat={chat_id} sender={sender_id} "
-            f"mode={mode} prompt_len={len(prompt)}",
-            file=sys.stderr,
-        )
+            print(
+                f"[CLAUDE] New session for chat {chat_id} "
+                f"({len(history)} messages)",
+                file=sys.stderr,
+            )
 
         result = await run_claude(
             prompt,
@@ -304,6 +321,14 @@ async def _process_trigger(
             mcp_api_key=cfg.mcp_api_key,
             resume_session_id=resume_session_id,
         )
+
+        if not result.success:
+            print(
+                f"[CLAUDE] CLI failed for chat {chat_id} "
+                f"(session={result.session_id}, resume={result.resumed}): "
+                f"{result.error}",
+                file=sys.stderr,
+            )
 
         if result.success and result.text:
             response = f"{result.text}\n\n{random_signature()}"
@@ -327,25 +352,33 @@ async def _process_trigger(
                     # threshold check resumes.
                     just_compacted=compacted_now,
                 )
-            except Exception:
+            except Exception as e:
+                print(
+                    f"[CLAUDE] Failed to persist chat session for chat {chat_id}: {e!r}",
+                    file=sys.stderr,
+                )
                 logger.exception("Failed to persist chat session for chat_id=%s", chat_id)
-
-        print(
-            f"[@claude] result chat={chat_id} ok={result.success} "
-            f"mode={mode} resumed={result.resumed} tokens={result.total_tokens} "
-            f"cost=${result.cost_usd:.4f} len={len(result.text)}",
-            file=sys.stderr,
-        )
 
         try:
             await client.edit_message(chat_id, ack.id, response)
-        except Exception:
-            logger.exception("Edit-in-place failed; sending fresh message")
+        except Exception as e:
+            print(
+                f"[CLAUDE] Failed to edit ack message {ack.id}, sending new: {e!r}",
+                file=sys.stderr,
+            )
             try:
                 await client.send_message(chat_id, response, reply_to=msg.id)
-            except Exception:
+            except Exception as e2:
+                print(
+                    f"[CLAUDE] Fallback send_message also failed for chat {chat_id}: {e2!r}",
+                    file=sys.stderr,
+                )
                 logger.exception("Fallback send_message also failed")
     except Exception:
+        print(
+            f"[CLAUDE] Trigger pipeline crashed for chat {chat_id}",
+            file=sys.stderr,
+        )
         logger.exception("Trigger pipeline crashed")
         try:
             await client.edit_message(
@@ -369,7 +402,7 @@ def register(
     client.add_event_handler(handler, events.NewMessage(incoming=None))
     client.add_event_handler(handler, events.MessageEdited(incoming=None))
     print(
-        f"[@claude] trigger registered (owner={cfg.owner_user_id}, "
+        f"[CLAUDE] Trigger registered (owner={cfg.owner_user_id}, "
         f"port={cfg.mcp_port}, vault={cfg.memory_vault or 'none'}, "
         f"db={cfg.db_path})",
         file=sys.stderr,

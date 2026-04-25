@@ -78,6 +78,12 @@ async def run_claude(
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
+    print(
+        f"[CLAUDE] Spawning: {claude_path} "
+        f"(model={model}, session={session_id}, resume={str(resumed).lower()})",
+        file=sys.stderr,
+    )
+
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -134,7 +140,11 @@ async def run_claude(
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
-        logger.warning("Claude CLI did not return JSON; using raw stdout")
+        print(
+            f"[CLAUDE] Failed to parse JSON output (falling back to raw): "
+            f"first 200 chars: {stdout[:200]!r}",
+            file=sys.stderr,
+        )
         return ClaudeResult(
             success=True,
             text=stdout.strip(),
@@ -147,15 +157,26 @@ async def run_claude(
     input_t = int(usage.get("input_tokens", 0) or 0)
     cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
     cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+    output_t = int(usage.get("output_tokens", 0) or 0)
     num_turns = max(int(data.get("num_turns", 1) or 1), 1)
-    total = (input_t + cache_create + cache_read) // num_turns
+    raw_total = input_t + cache_create + cache_read
+    est_context = raw_total // num_turns
+    cost = float(data.get("total_cost_usd", 0.0) or 0.0)
+
+    print(
+        f"[CLAUDE] Turn complete: num_turns={num_turns} input={input_t} "
+        f"cache_create={cache_create} cache_read={cache_read} "
+        f"raw_total={raw_total} est_context={est_context} output={output_t} "
+        f"cost=${cost:.4f}",
+        file=sys.stderr,
+    )
 
     return ClaudeResult(
         success=True,
         text=text,
-        cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
+        cost_usd=cost,
         num_turns=num_turns,
-        total_tokens=total,
+        total_tokens=est_context,
         session_id=session_id,
         resumed=resumed,
     )
