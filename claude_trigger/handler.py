@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 from telethon import events
 from telethon.tl.custom import Message
+from telethon.tl.functions.messages import GetMessageReactionsListRequest
+from telethon.tl.types import MessageReplyHeader
 
 from .config import TriggerConfig
 from .locks import ChatLockManager
@@ -65,25 +67,123 @@ async def _resolve_chat_name(client, chat_id: int) -> str:
 async def _gather_history(
     client, chat_id: int, limit: int, owner_id: int
 ) -> list[HistMsg]:
-    out: list[HistMsg] = []
+    raw: list[Message] = []
     async for m in client.iter_messages(chat_id, limit=limit):
         text = m.text or ""
         if not text:
             continue
         if is_thinking_message(text):
             continue
+        raw.append(m)
+
+    # Per-call name cache so we resolve each user at most once across
+    # message senders, reactors, and quote-reply parents.
+    name_cache: dict[int, str] = {0: "Unknown"}
+    if owner_id:
+        name_cache[owner_id] = "Steve"
+
+    async def name_for(uid: int) -> str:
+        if uid in name_cache:
+            return name_cache[uid]
+        n = await _resolve_sender_name(client, uid)
+        name_cache[uid] = n
+        return n
+
+    # --- Bulk fetch parent messages for any quote-replies in the slice ---
+    reply_ids: list[int] = []
+    for m in raw:
+        rt = getattr(m, "reply_to", None)
+        if not isinstance(rt, MessageReplyHeader):
+            continue
+        # Cross-chat replies (reply_to_peer_id set) point at a different
+        # peer; skip — fetching from the wrong chat would error and the
+        # parent isn't part of *this* conversation anyway.
+        if getattr(rt, "reply_to_peer_id", None):
+            continue
+        pid = getattr(rt, "reply_to_msg_id", None)
+        if pid:
+            reply_ids.append(pid)
+    parents: dict[int, Message] = {}
+    if reply_ids:
+        try:
+            fetched = await client.get_messages(chat_id, ids=reply_ids)
+            for p in fetched:
+                if p is not None:
+                    parents[p.id] = p
+        except Exception as e:
+            print(
+                f"[CLAUDE] Quote-parent fetch failed for chat {chat_id}: {e!r}",
+                file=sys.stderr,
+            )
+
+    # --- Per-message reactor lookups (parallel) ---
+    async def fetch_reactions_for(m: Message) -> list[tuple[str, str]]:
+        if not getattr(m, "reactions", None):
+            return []
+        # Rich path: resolve each reactor's name. limit=20 is plenty for
+        # group chats — beyond that we render a count instead.
+        try:
+            res = await client(
+                GetMessageReactionsListRequest(peer=chat_id, id=m.id, limit=20)
+            )
+        except Exception:
+            res = None
+        if res is not None and getattr(res, "reactions", None):
+            grouped: dict[str, list[int]] = {}
+            for pr in res.reactions:
+                emoji = getattr(pr.reaction, "emoticon", None) or "?"
+                uid = getattr(pr.peer_id, "user_id", None) or 0
+                grouped.setdefault(emoji, []).append(uid)
+            unique_uids = {u for uids in grouped.values() for u in uids}
+            for uid in unique_uids:
+                await name_for(uid)
+            return [
+                (emoji, ", ".join(name_cache[uid] for uid in uids))
+                for emoji, uids in grouped.items()
+            ]
+        # Fallback: emoji + count, no names. Some chat types refuse the
+        # reactions-list request (private DMs without seen-by, channels
+        # without reaction visibility) but still expose .reactions counts.
+        return [
+            (getattr(r.reaction, "emoticon", None) or "?", f"×{r.count}")
+            for r in m.reactions.results
+        ]
+
+    react_lists = await asyncio.gather(
+        *(fetch_reactions_for(m) for m in raw),
+        return_exceptions=True,
+    )
+
+    out: list[HistMsg] = []
+    for m, reactions in zip(raw, react_lists):
+        if isinstance(reactions, BaseException) or reactions is None:
+            reactions = []
+
         sender_id = m.sender_id or 0
         is_owner = sender_id == owner_id
-        sender_name = "Steve" if is_owner else await _resolve_sender_name(client, sender_id)
+        sender_name = await name_for(sender_id)
         ts = m.date or datetime.now(timezone.utc)
+
+        reply_preview: tuple[str, str] | None = None
+        rt = getattr(m, "reply_to", None)
+        if isinstance(rt, MessageReplyHeader):
+            pid = getattr(rt, "reply_to_msg_id", None)
+            parent = parents.get(pid) if pid else None
+            ptext = getattr(parent, "text", None) if parent is not None else None
+            if parent is not None and ptext:
+                parent_sender = await name_for(parent.sender_id or 0)
+                reply_preview = (parent_sender, ptext)
+
         out.append(
             HistMsg(
                 sender_id=sender_id,
                 sender_name=sender_name,
                 timestamp=ts,
-                text=text,
+                text=m.text or "",
                 is_owner=is_owner,
                 id=m.id,
+                reactions=reactions,
+                reply_preview=reply_preview,
             )
         )
     out.reverse()  # oldest first

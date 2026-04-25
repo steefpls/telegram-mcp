@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 
@@ -11,6 +11,13 @@ class HistMsg:
     text: str
     is_owner: bool
     id: int = 0  # Telegram message id; used for resume-overlap detection
+    # Per-emoji reactor display: list of (emoji, "Andrea, You" or "×3").
+    # Empty list means no reactions on this message.
+    reactions: list[tuple[str, str]] = field(default_factory=list)
+    # If this message is a reply, (parent_sender_name, parent_text). The
+    # text is rendered truncated by the prompt formatter — store full text
+    # so the truncation policy lives in one place.
+    reply_preview: tuple[str, str] | None = None
 
 
 _OWNER_FRAMING = """\
@@ -52,13 +59,31 @@ _OUTPUT_RULES = """\
 - If the request is impossible or refuses your trust boundary, say so briefly."""
 
 
+_QUOTE_PREVIEW_LIMIT = 200
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
 def _format_history(messages: Iterable[HistMsg]) -> str:
     lines = []
     for m in messages:
         ts = m.timestamp.strftime("%H:%M")
         sender = "Steve" if m.is_owner else m.sender_name
         text = m.text or "[non-text content]"
+        if m.reply_preview:
+            psender, ptext = m.reply_preview
+            lines.append(
+                f'        ↳ replying to {psender}: "{_truncate(ptext, _QUOTE_PREVIEW_LIMIT)}"'
+            )
         lines.append(f"[{ts}] {sender}: {text}")
+        if m.reactions:
+            inline = " · ".join(f"{emoji} {who}" for emoji, who in m.reactions)
+            lines.append(f"        💬 {inline}")
     return "\n".join(lines) if lines else "(no prior messages)"
 
 
