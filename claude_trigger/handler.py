@@ -224,6 +224,7 @@ def _build_event_handler(
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
     media: MediaStore | None,
+    mcp=None,
 ):
     async def handler(event):
         msg = getattr(event, "message", None)
@@ -233,7 +234,7 @@ def _build_event_handler(
         # idempotent per message_id).
         if msg is not None and media is not None:
             try:
-                schedule_download(client, msg, cfg=cfg, store=media)
+                schedule_download(client, msg, cfg=cfg, store=media, mcp=mcp)
             except Exception:
                 logger.exception("Failed to schedule media download")
         try:
@@ -635,11 +636,16 @@ def register(
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
     media: MediaStore | None = None,
+    mcp=None,
 ) -> None:
     """Wire @claude trigger handlers onto the Telethon client. Caller is
-    responsible for running an HTTP transport (see configure_http_transport)."""
+    responsible for running an HTTP transport (see configure_http_transport).
+    `mcp` is the FastMCP instance — required for media auto-download to
+    register concrete FileResource per (chat, message) with the actual
+    mime_type (so spawned Claude can render images / play audio natively
+    instead of getting opaque octet-stream blobs)."""
     locks = ChatLockManager()
-    handler = _build_event_handler(client, cfg, locks, sessions, trusted, media)
+    handler = _build_event_handler(client, cfg, locks, sessions, trusted, media, mcp)
     # incoming=None catches both incoming and outgoing — Steve can self-trigger.
     client.add_event_handler(handler, events.NewMessage(incoming=None))
     client.add_event_handler(handler, events.MessageEdited(incoming=None))

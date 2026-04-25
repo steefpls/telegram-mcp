@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from mcp.server.fastmcp.resources.types import FileResource
 from telethon.tl.custom import Message
 from telethon.tl.types import (
     DocumentAttributeAnimated,
@@ -42,6 +43,105 @@ logger = logging.getLogger("telegram_mcp.claude_trigger.media")
 # Keyed weakly via a plain dict — entries cleaned up by the task itself on
 # completion.
 _inflight: dict[tuple[int, int], asyncio.Task] = {}
+
+
+def _resource_uri(chat_id: int, message_id: int) -> str:
+    return f"tg://media/{chat_id}/{message_id}"
+
+
+def _normalize_mime(mime: str | None) -> str:
+    """Coerce mime to FastMCP's strict pattern (`^[a-zA-Z0-9]+/[a-zA-Z0-9\\-+.]+$`)
+    or fall back to application/octet-stream. Pydantic rejects anything outside
+    that pattern at FileResource construction time."""
+    if not mime:
+        return "application/octet-stream"
+    import re
+    if re.fullmatch(r"[a-zA-Z0-9]+/[a-zA-Z0-9\-+.]+", mime):
+        return mime
+    return "application/octet-stream"
+
+
+def register_concrete_resource(
+    mcp,
+    *,
+    chat_id: int,
+    message_id: int,
+    file_path: str,
+    mime_type: str | None,
+    file_name: str | None,
+) -> None:
+    """Register a FileResource at `tg://media/{chat_id}/{message_id}` with the
+    actual mime so spawned Claude reads the bytes with the correct content
+    type. Concrete URIs win over the catch-all `application/octet-stream`
+    template at resource_manager.py:92.
+
+    Idempotent: ResourceManager.add_resource silently returns the existing
+    entry if the URI is already registered (warns once via logger).
+    """
+    if mcp is None:
+        return
+    norm = _normalize_mime(mime_type)
+    try:
+        path = Path(file_path).resolve()
+        resource = FileResource(
+            uri=_resource_uri(chat_id, message_id),  # type: ignore[arg-type]
+            name=f"telegram_media_{chat_id}_{message_id}",
+            description=(
+                f"Auto-downloaded media attached to Telegram message "
+                f"{message_id} in chat {chat_id} ({file_name or path.name})"
+            ),
+            mime_type=norm,
+            path=path,
+            is_binary=not norm.startswith("text/"),
+        )
+        mcp.add_resource(resource)
+    except Exception as e:
+        print(
+            f"[CLAUDE] Failed to register concrete media resource for "
+            f"chat={chat_id} msg={message_id}: {e!r}",
+            file=sys.stderr,
+        )
+        logger.exception("Failed to register concrete media resource")
+
+
+def reregister_existing(mcp, store: MediaStore) -> int:
+    """Re-register concrete FileResources for every already-downloaded row in
+    media_metadata at daemon startup. Without this, photos downloaded before
+    a daemon restart fall back to the template (octet-stream) and Claude
+    Code can't render them as images. Returns count registered.
+    """
+    if mcp is None:
+        return 0
+    try:
+        rows = store._db.fetchall(
+            "SELECT chat_id, message_id, mime_type, file_name, file_path "
+            "FROM media_metadata WHERE status = 'downloaded' AND file_path IS NOT NULL"
+        )
+    except Exception as e:
+        print(
+            f"[CLAUDE] Failed to reload media_metadata for re-registration: {e!r}",
+            file=sys.stderr,
+        )
+        return 0
+    n = 0
+    for chat_id, message_id, mime_type, file_name, file_path in rows:
+        if not file_path or not Path(file_path).exists():
+            continue
+        register_concrete_resource(
+            mcp,
+            chat_id=chat_id,
+            message_id=message_id,
+            file_path=file_path,
+            mime_type=mime_type,
+            file_name=file_name,
+        )
+        n += 1
+    if n:
+        print(
+            f"[CLAUDE] Re-registered {n} downloaded media as MCP resources",
+            file=sys.stderr,
+        )
+    return n
 
 
 def _detect_kind_and_meta(
@@ -176,6 +276,9 @@ async def _download_one(
     message_id: int,
     target_path: Path,
     store: MediaStore,
+    mime_type: str | None,
+    file_name: str | None,
+    mcp,
 ) -> None:
     try:
         store.mark_downloading(chat_id, message_id)
@@ -196,9 +299,21 @@ async def _download_one(
         store.mark_downloaded(
             chat_id, message_id, file_path=str(final), file_size=size
         )
+        # Register a concrete FileResource with the actual mime_type — this
+        # is what lets spawned Claude Code render photos as images, voice
+        # notes as audio, etc., instead of opaque octet-stream blobs that
+        # its tools then refuse to write to disk in restricted paths.
+        register_concrete_resource(
+            mcp,
+            chat_id=chat_id,
+            message_id=message_id,
+            file_path=str(final),
+            mime_type=mime_type,
+            file_name=file_name,
+        )
         print(
             f"[CLAUDE] Media downloaded chat={chat_id} msg={message_id} "
-            f"path={final.name} size={size}",
+            f"path={final.name} size={size} mime={mime_type or 'unknown'}",
             file=sys.stderr,
         )
     except asyncio.CancelledError:
@@ -220,6 +335,7 @@ def schedule_download(
     *,
     cfg: TriggerConfig,
     store: MediaStore,
+    mcp=None,
 ) -> None:
     """Inspect `msg`, register a media row, and (if filters pass) kick off a
     background download task. Safe to call on every NewMessage — text-only
@@ -295,6 +411,9 @@ def schedule_download(
             message_id=message_id,
             target_path=target,
             store=store,
+            mime_type=mime,
+            file_name=file_name,
+            mcp=mcp,
         )
     )
     _inflight[key] = task

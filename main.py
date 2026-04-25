@@ -4792,6 +4792,7 @@ async def _main() -> None:
                 register_mcp_tools,
                 register_media_resource,
             )
+            from claude_trigger.media import reregister_existing as _reregister_media
 
             db = open_database(trigger_cfg.db_path)
             sessions = ChatSessionStore(db, ttl_hours=trigger_cfg.session_ttl_hours)
@@ -4799,9 +4800,16 @@ async def _main() -> None:
             media_store = MediaStore(db)
             os.makedirs(trigger_cfg.media_dir, exist_ok=True)
 
-            register_trigger(client, trigger_cfg, sessions, trusted, media_store)
+            register_trigger(client, trigger_cfg, sessions, trusted, media_store, mcp=mcp)
             register_mcp_tools(mcp, trusted)
             register_media_resource(mcp, media_store)
+            # Re-register concrete FileResources for media downloaded by a
+            # prior daemon — without this, files on disk fall back to the
+            # template's catch-all octet-stream mime and Claude Code can't
+            # render them natively (the trigger is fine but image/audio
+            # rendering requires the real mime per FastMCP's static-template
+            # mime constraint).
+            _reregister_media(mcp, media_store)
             configure_http_transport(mcp, trigger_cfg)
             print(
                 "Telegram MCP daemon ready (HTTP + @claude trigger).",
