@@ -4,11 +4,13 @@ Registered onto the FastMCP server only when the @claude trigger is
 enabled. The owner (TriggerConfig.owner_user_id) is implicitly trusted
 and is NOT stored in this table — these tools manage everyone else.
 """
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from mcp.types import ToolAnnotations
 
-from .store import TrustedUserStore
+from .store import MediaStore, TrustedUserStore
 
 
 def register_mcp_tools(mcp, store: TrustedUserStore) -> None:
@@ -80,3 +82,66 @@ def register_mcp_tools(mcp, store: TrustedUserStore) -> None:
             note = f" — {r.note}" if r.note else ""
             lines.append(f"  - {r.user_id}{note} (added {ts})")
         return "Trusted users:\n" + "\n".join(lines)
+
+
+def register_media_resource(mcp, media: MediaStore) -> None:
+    """Register the `tg://media/{chat_id}/{message_id}` resource template so
+    spawned Claude can read auto-downloaded attachments via the MCP resource
+    protocol. Returns file bytes when the download landed; a short text stub
+    otherwise (so the model gets a useful error rather than an exception).
+
+    All instances of the template share `application/octet-stream` as their
+    declared mime_type — FastMCP doesn't support per-instance mime overrides
+    on a template. The actual mime is communicated to the model through the
+    inline prompt line ("📎 attached: foo.jpg (image/jpeg, 12KB) — read with
+    MCP resource: tg://media/...") so the loss is purely cosmetic.
+    """
+
+    @mcp.resource(
+        "tg://media/{chat_id}/{message_id}",
+        name="telegram_media",
+        description=(
+            "Auto-downloaded media (photo/voice/video/document/etc) attached "
+            "to a Telegram message. URI scheme: tg://media/{chat_id}/{message_id}. "
+            "Returns the raw file bytes when the background downloader has "
+            "finished, or a short text stub when the download is pending, "
+            "skipped by filters, or failed."
+        ),
+        mime_type="application/octet-stream",
+    )
+    async def telegram_media(chat_id: str, message_id: str) -> bytes | str:
+        try:
+            cid = int(chat_id)
+            mid = int(message_id)
+        except ValueError:
+            return f"tg://media: invalid chat_id={chat_id!r} or message_id={message_id!r}"
+
+        rec = media.get(cid, mid)
+        if rec is None:
+            return (
+                f"tg://media/{cid}/{mid}: no media tracked for that message "
+                "(text-only message, kind not in MEDIA_AUTO_DOWNLOAD_TYPES, or "
+                "predates the media-tracking migration)"
+            )
+
+        if rec.status == "downloaded" and rec.file_path:
+            path = Path(rec.file_path)
+            if not path.exists():
+                return (
+                    f"tg://media/{cid}/{mid}: marked downloaded but file missing "
+                    f"on disk at {rec.file_path}"
+                )
+            try:
+                return path.read_bytes()
+            except Exception as e:
+                print(
+                    f"[CLAUDE] Failed to read media file {rec.file_path}: {e!r}",
+                    file=sys.stderr,
+                )
+                return f"tg://media/{cid}/{mid}: read error: {e!r}"
+
+        return (
+            f"tg://media/{cid}/{mid}: status={rec.status} (kind={rec.kind}, "
+            f"mime={rec.mime_type}, name={rec.file_name}). "
+            f"{rec.error or 'No file available.'}"
+        )

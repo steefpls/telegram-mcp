@@ -4,6 +4,24 @@ from typing import Iterable
 
 
 @dataclass
+class MediaInfo:
+    """Per-message media descriptor for prompt rendering.
+
+    `chat_id` + `message_id` together compose the `tg://media/{chat_id}/{message_id}`
+    resource URI Claude reads. `status` mirrors MediaRecord.status so the
+    formatter can show different text for downloaded / pending / failed /
+    skipped attachments without the formatter touching the DB.
+    """
+    chat_id: int
+    message_id: int
+    kind: str
+    mime_type: str | None
+    file_name: str | None
+    file_size: int | None
+    status: str  # downloaded|pending|failed|skipped|expired|downloading
+
+
+@dataclass
 class HistMsg:
     sender_id: int
     sender_name: str
@@ -18,6 +36,8 @@ class HistMsg:
     # text is rendered truncated by the prompt formatter — store full text
     # so the truncation policy lives in one place.
     reply_preview: tuple[str, str] | None = None
+    # Attached media descriptor; None for plain text messages.
+    media: MediaInfo | None = None
 
 
 _OWNER_FRAMING = """\
@@ -69,18 +89,57 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
+def _format_size(size: int | None) -> str:
+    if not size or size <= 0:
+        return "?"
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size / (1024 * 1024):.1f}MB"
+
+
+def _format_media(media: "MediaInfo") -> str:
+    name = media.file_name or f"{media.kind}_{media.message_id}"
+    mime = media.mime_type or "application/octet-stream"
+    size = _format_size(media.file_size)
+    uri = f"tg://media/{media.chat_id}/{media.message_id}"
+    if media.status == "downloaded":
+        return (
+            f'        📎 attached {media.kind}: "{name}" ({mime}, {size}) — '
+            f"read with MCP resource: {uri}"
+        )
+    if media.status in ("pending", "downloading"):
+        return (
+            f'        📎 attached {media.kind}: "{name}" ({mime}, {size}) — '
+            f"download still in flight, may not be readable yet at {uri}"
+        )
+    if media.status == "skipped":
+        return (
+            f'        📎 attached {media.kind}: "{name}" ({mime}, {size}) — '
+            "skipped by media filters, not downloaded"
+        )
+    # failed / expired / unknown
+    return (
+        f'        📎 attached {media.kind}: "{name}" ({mime}, {size}) — '
+        f"download {media.status}, not available"
+    )
+
+
 def _format_history(messages: Iterable[HistMsg]) -> str:
     lines = []
     for m in messages:
         ts = m.timestamp.strftime("%H:%M")
         sender = "Steve" if m.is_owner else m.sender_name
-        text = m.text or "[non-text content]"
+        text = m.text or ("[media-only message]" if m.media else "[non-text content]")
         if m.reply_preview:
             psender, ptext = m.reply_preview
             lines.append(
                 f'        ↳ replying to {psender}: "{_truncate(ptext, _QUOTE_PREVIEW_LIMIT)}"'
             )
         lines.append(f"[{ts}] {sender}: {text}")
+        if m.media:
+            lines.append(_format_media(m.media))
         if m.reactions:
             inline = " · ".join(f"{emoji} {who}" for emoji, who in m.reactions)
             lines.append(f"        💬 {inline}")

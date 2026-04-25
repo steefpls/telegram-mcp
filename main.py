@@ -4784,19 +4784,24 @@ async def _main() -> None:
         if trigger_cfg is not None:
             from claude_trigger import (
                 ChatSessionStore,
+                MediaStore,
                 TrustedUserStore,
                 configure_http_transport,
                 open_database,
                 register as register_trigger,
                 register_mcp_tools,
+                register_media_resource,
             )
 
             db = open_database(trigger_cfg.db_path)
             sessions = ChatSessionStore(db, ttl_hours=trigger_cfg.session_ttl_hours)
             trusted = TrustedUserStore(db)
+            media_store = MediaStore(db)
+            os.makedirs(trigger_cfg.media_dir, exist_ok=True)
 
-            register_trigger(client, trigger_cfg, sessions, trusted)
+            register_trigger(client, trigger_cfg, sessions, trusted, media_store)
             register_mcp_tools(mcp, trusted)
+            register_media_resource(mcp, media_store)
             configure_http_transport(mcp, trigger_cfg)
             print(
                 "Telegram MCP daemon ready (HTTP + @claude trigger).",

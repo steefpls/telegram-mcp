@@ -10,6 +10,7 @@ from telethon.tl.types import MessageReplyHeader
 
 from .config import TriggerConfig
 from .locks import ChatLockManager
+from .media import schedule_download
 from .messages import (
     is_claude_response,
     is_thinking_message,
@@ -18,13 +19,14 @@ from .messages import (
 )
 from .prompt import (
     HistMsg,
+    MediaInfo,
     build_compaction_summary_prompt,
     build_post_compact_prompt,
     build_prompt,
     build_resume_prompt,
 )
 from .runner import ClaudeResult, run_claude
-from .store import ChatSessionStore, TrustedUserStore
+from .store import ChatSessionStore, MediaStore, TrustedUserStore
 
 # Fallback retry pause between attempt 2 (fresh after resume failure) and
 # attempt 3 (sleep+retry fresh). Short enough that the user doesn't notice;
@@ -65,14 +67,22 @@ async def _resolve_chat_name(client, chat_id: int) -> str:
 
 
 async def _gather_history(
-    client, chat_id: int, limit: int, owner_id: int
+    client,
+    chat_id: int,
+    limit: int,
+    owner_id: int,
+    media_store: MediaStore | None = None,
 ) -> list[HistMsg]:
     raw: list[Message] = []
     async for m in client.iter_messages(chat_id, limit=limit):
         text = m.text or ""
-        if not text:
-            continue
         if is_thinking_message(text):
+            continue
+        # Keep messages with attached media even when text is empty — the
+        # prompt formatter will render the media line, and dropping these
+        # would leave Claude blind to photo/voice replies that came in
+        # without a caption.
+        if not text and not getattr(m, "media", None):
             continue
         raw.append(m)
 
@@ -154,6 +164,22 @@ async def _gather_history(
         return_exceptions=True,
     )
 
+    # Bulk-fetch media records for the slice in one query.
+    media_by_msg_id: dict[int, "MediaInfo"] = {}
+    if media_store is not None:
+        msg_ids_with_media = [m.id for m in raw if getattr(m, "media", None)]
+        records = media_store.get_many(chat_id, msg_ids_with_media) if msg_ids_with_media else {}
+        for mid, rec in records.items():
+            media_by_msg_id[mid] = MediaInfo(
+                chat_id=rec.chat_id,
+                message_id=rec.message_id,
+                kind=rec.kind,
+                mime_type=rec.mime_type,
+                file_name=rec.file_name,
+                file_size=rec.file_size,
+                status=rec.status,
+            )
+
     out: list[HistMsg] = []
     for m, reactions in zip(raw, react_lists):
         if isinstance(reactions, BaseException) or reactions is None:
@@ -184,6 +210,7 @@ async def _gather_history(
                 id=m.id,
                 reactions=reactions,
                 reply_preview=reply_preview,
+                media=media_by_msg_id.get(m.id),
             )
         )
     out.reverse()  # oldest first
@@ -196,10 +223,21 @@ def _build_event_handler(
     locks: ChatLockManager,
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
+    media: MediaStore | None,
 ):
     async def handler(event):
+        msg = getattr(event, "message", None)
+        # Always kick off media auto-download for any message we observe,
+        # regardless of @claude — so when a trigger fires later the file is
+        # already on disk. schedule_download is cheap (no-op for text-only,
+        # idempotent per message_id).
+        if msg is not None and media is not None:
+            try:
+                schedule_download(client, msg, cfg=cfg, store=media)
+            except Exception:
+                logger.exception("Failed to schedule media download")
         try:
-            await _maybe_dispatch(client, cfg, locks, sessions, trusted, event)
+            await _maybe_dispatch(client, cfg, locks, sessions, trusted, media, event)
         except Exception:
             logger.exception("Unhandled error in @claude event handler")
 
@@ -212,6 +250,7 @@ async def _maybe_dispatch(
     locks: ChatLockManager,
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
+    media: MediaStore | None,
     event,
 ) -> None:
     msg: Message = event.message
@@ -238,7 +277,7 @@ async def _maybe_dispatch(
     chat_id = msg.chat_id
     lock = locks.get(chat_id)
     async with lock:
-        await _process_trigger(client, cfg, sessions, msg, chat_id, sender_id)
+        await _process_trigger(client, cfg, sessions, media, msg, chat_id, sender_id)
 
 
 async def _run_with_fallback(
@@ -318,6 +357,7 @@ async def _process_trigger(
     client,
     cfg: TriggerConfig,
     sessions: ChatSessionStore,
+    media: MediaStore | None,
     msg: Message,
     chat_id: int,
     sender_id: int,
@@ -331,9 +371,37 @@ async def _process_trigger(
         return
 
     try:
+        # First pass: gather history without waiting for media (cheap), so we
+        # know which message_ids in the slice carry attachments.
         history = await _gather_history(
-            client, chat_id, cfg.history_messages, cfg.owner_user_id
+            client, chat_id, cfg.history_messages, cfg.owner_user_id, media
         )
+
+        # Wait briefly for any in-flight downloads in the slice. This lets a
+        # photo Steve sent ~2 seconds before the @claude trigger settle into
+        # `downloaded` so the prompt formatter can render the resource URI
+        # with confidence rather than a "still in flight" stub.
+        if media is not None and cfg.media_wait_timeout_seconds > 0:
+            pending_ids = [
+                m.id for m in history
+                if m.media is not None and m.media.status in ("pending", "downloading")
+            ]
+            if pending_ids:
+                print(
+                    f"[CLAUDE] Waiting up to {cfg.media_wait_timeout_seconds}s for "
+                    f"{len(pending_ids)} pending media download(s) in chat {chat_id}",
+                    file=sys.stderr,
+                )
+                await media.wait_for_pending(
+                    chat_id,
+                    pending_ids,
+                    timeout_seconds=cfg.media_wait_timeout_seconds,
+                )
+                # Re-gather so HistMsg.media reflects the latest statuses.
+                history = await _gather_history(
+                    client, chat_id, cfg.history_messages, cfg.owner_user_id, media
+                )
+
         chat_name = await _resolve_chat_name(client, chat_id)
         requester_is_owner = sender_id == cfg.owner_user_id
         requester_name = (
@@ -566,18 +634,26 @@ def register(
     cfg: TriggerConfig,
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
+    media: MediaStore | None = None,
 ) -> None:
     """Wire @claude trigger handlers onto the Telethon client. Caller is
     responsible for running an HTTP transport (see configure_http_transport)."""
     locks = ChatLockManager()
-    handler = _build_event_handler(client, cfg, locks, sessions, trusted)
+    handler = _build_event_handler(client, cfg, locks, sessions, trusted, media)
     # incoming=None catches both incoming and outgoing — Steve can self-trigger.
     client.add_event_handler(handler, events.NewMessage(incoming=None))
     client.add_event_handler(handler, events.MessageEdited(incoming=None))
+    media_state = (
+        f"on (max={cfg.media_max_size_mb}MB, "
+        f"types={','.join(sorted(cfg.media_types)) or 'none'}, "
+        f"dir={cfg.media_dir})"
+        if (media is not None and cfg.media_auto_download_enabled)
+        else "off"
+    )
     print(
         f"[CLAUDE] Trigger registered (owner={cfg.owner_user_id}, "
         f"port={cfg.mcp_port}, vault={cfg.memory_vault or 'none'}, "
-        f"db={cfg.db_path})",
+        f"db={cfg.db_path}, media={media_state})",
         file=sys.stderr,
     )
 

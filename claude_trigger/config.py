@@ -1,10 +1,38 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
-def _truthy(value: Optional[str]) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+# Telethon media kinds we're willing to auto-download. "document" covers any
+# DocumentAttribute file that doesn't match a more specific kind (audio, video,
+# voice, video_note, gif, sticker). Webpages and contacts are intentionally
+# excluded — no useful bytes for the model to read.
+_KNOWN_MEDIA_KINDS = frozenset({
+    "photo", "voice", "audio", "video", "video_note", "gif", "sticker", "document",
+})
+
+# Default set if MEDIA_AUTO_DOWNLOAD_TYPES is not set. Skips stickers (noisy in
+# group chats, low information density) and large unspecified documents.
+_DEFAULT_MEDIA_TYPES = "photo,voice,audio,video,video_note,gif,document"
+
+
+def _truthy(value: Optional[str], default: bool = False) -> bool:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parse_media_types(raw: str) -> frozenset[str]:
+    parts = [p.strip().lower() for p in raw.split(",")]
+    parts = [p for p in parts if p]
+    unknown = [p for p in parts if p not in _KNOWN_MEDIA_KINDS]
+    if unknown:
+        raise RuntimeError(
+            f"MEDIA_AUTO_DOWNLOAD_TYPES has unknown kinds: {unknown}. "
+            f"Allowed: {sorted(_KNOWN_MEDIA_KINDS)}"
+        )
+    return frozenset(parts)
 
 
 @dataclass(frozen=True)
@@ -24,6 +52,11 @@ class TriggerConfig:
     compact_model: str
     compact_timeout_seconds: int
     compact_max_budget_usd: str
+    media_auto_download_enabled: bool
+    media_max_size_mb: int
+    media_types: frozenset[str] = field(default_factory=frozenset)
+    media_dir: str = "data/media"
+    media_wait_timeout_seconds: float = 10.0
 
     @classmethod
     def from_env(cls) -> Optional["TriggerConfig"]:
@@ -65,4 +98,21 @@ class TriggerConfig:
             compact_max_budget_usd=os.getenv(
                 "CLAUDE_COMPACT_MAX_BUDGET_USD", "0.50"
             ).strip(),
+            # Default ON when the trigger is enabled — auto-downloading media
+            # is the whole point of having a 24/7 daemon. Operator can disable
+            # explicitly with MEDIA_AUTO_DOWNLOAD_ENABLED=false.
+            media_auto_download_enabled=_truthy(
+                os.getenv("MEDIA_AUTO_DOWNLOAD_ENABLED"), default=True
+            ),
+            media_max_size_mb=int(os.getenv("MEDIA_AUTO_DOWNLOAD_MAX_SIZE_MB", "20")),
+            media_types=_parse_media_types(
+                os.getenv("MEDIA_AUTO_DOWNLOAD_TYPES", _DEFAULT_MEDIA_TYPES)
+            ),
+            media_dir=os.getenv("MEDIA_DOWNLOAD_DIR", "data/media").strip(),
+            # Tight upper bound — the user is staring at "thinking..." in
+            # the chat while we wait. 10s is enough for typical photos /
+            # voice notes; oversized docs should already be `skipped`.
+            media_wait_timeout_seconds=float(
+                os.getenv("MEDIA_WAIT_TIMEOUT_SECONDS", "10")
+            ),
         )
