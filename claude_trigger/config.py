@@ -18,6 +18,8 @@ class TriggerConfig:
     owner_user_id: int
     memory_vault: str
     history_messages: int
+    db_path: str
+    session_ttl_hours: int
 
     @classmethod
     def from_env(cls) -> Optional["TriggerConfig"]:
@@ -47,4 +49,6 @@ class TriggerConfig:
             owner_user_id=int(owner),
             memory_vault=os.getenv("MEMORY_VAULT", "").strip(),
             history_messages=int(os.getenv("CLAUDE_HISTORY_MESSAGES", "40")),
+            db_path=os.getenv("CLAUDE_TRIGGER_DB_PATH", "data/telegram_mcp.db").strip(),
+            session_ttl_hours=int(os.getenv("CLAUDE_SESSION_TTL_HOURS", "24")),
         )

@@ -19,6 +19,8 @@ class ClaudeResult:
     num_turns: int = 0
     total_tokens: int = 0
     error: str = ""
+    session_id: str = ""  # the uuid passed via --session-id or --resume
+    resumed: bool = False
 
 
 def _make_mcp_config(port: int, api_key: str) -> str:
@@ -45,8 +47,16 @@ async def run_claude(
     timeout_seconds: int,
     mcp_port: int,
     mcp_api_key: str,
+    resume_session_id: str = "",
 ) -> ClaudeResult:
-    session_id = str(uuid.uuid4())
+    if resume_session_id:
+        session_id = resume_session_id
+        session_flag = "--resume"
+        resumed = True
+    else:
+        session_id = str(uuid.uuid4())
+        session_flag = "--session-id"
+        resumed = False
     config_path = _make_mcp_config(mcp_port, mcp_api_key)
     args = [
         claude_path,
@@ -54,7 +64,7 @@ async def run_claude(
         "--output-format",
         "json",
         "--dangerously-skip-permissions",
-        "--session-id",
+        session_flag,
         session_id,
         "--mcp-config",
         config_path,
@@ -91,12 +101,16 @@ async def run_claude(
                 success=False,
                 text="",
                 error=f"Claude CLI timed out after {timeout_seconds}s",
+                session_id=session_id,
+                resumed=resumed,
             )
     except FileNotFoundError:
         return ClaudeResult(
             success=False,
             text="",
             error=f"Claude CLI not found at '{claude_path}' (set CLAUDE_PATH)",
+            session_id=session_id,
+            resumed=resumed,
         )
     finally:
         try:
@@ -113,13 +127,20 @@ async def run_claude(
             success=False,
             text="",
             error=f"Claude CLI exit {proc.returncode}: {snippet}",
+            session_id=session_id,
+            resumed=resumed,
         )
 
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         logger.warning("Claude CLI did not return JSON; using raw stdout")
-        return ClaudeResult(success=True, text=stdout.strip())
+        return ClaudeResult(
+            success=True,
+            text=stdout.strip(),
+            session_id=session_id,
+            resumed=resumed,
+        )
 
     text = (data.get("result") or "").strip()
     usage = data.get("usage") or {}
@@ -135,4 +156,6 @@ async def run_claude(
         cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
         num_turns=num_turns,
         total_tokens=total,
+        session_id=session_id,
+        resumed=resumed,
     )

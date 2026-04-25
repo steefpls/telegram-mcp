@@ -6,5 +6,15 @@ context, edits a thinking-message ack in-place with the response.
 """
 from .config import TriggerConfig
 from .handler import configure_http_transport, register
+from .mcp_tools import register_mcp_tools
+from .store import ChatSessionStore, TrustedUserStore, open_database
 
-__all__ = ["TriggerConfig", "configure_http_transport", "register"]
+__all__ = [
+    "TriggerConfig",
+    "configure_http_transport",
+    "register",
+    "register_mcp_tools",
+    "ChatSessionStore",
+    "TrustedUserStore",
+    "open_database",
+]

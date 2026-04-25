@@ -202,3 +202,7 @@ test_upload.txt
 test_voice.ogg
 sticker.webp
 two.png
+
+# Claude trigger runtime data (SQLite + WAL)
+/data/
+daemon.log

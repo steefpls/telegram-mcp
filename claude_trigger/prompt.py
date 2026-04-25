@@ -10,6 +10,7 @@ class HistMsg:
     timestamp: datetime
     text: str
     is_owner: bool
+    id: int = 0  # Telegram message id; used for resume-overlap detection
 
 
 _OWNER_FRAMING = """\
@@ -59,6 +60,48 @@ def _format_history(messages: Iterable[HistMsg]) -> str:
         text = m.text or "[non-text content]"
         lines.append(f"[{ts}] {sender}: {text}")
     return "\n".join(lines) if lines else "(no prior messages)"
+
+
+_RESUME_TRUST_OWNER = """\
+Continuing the existing Telegram session with Steve. He just sent more \
+messages — see below — and triggered you again with @claude. Trust frame \
+unchanged; respond for Steve."""
+
+_RESUME_TRUST_NON_OWNER = """\
+Continuing the existing Telegram session. {requester_name} (NOT Steve) sent \
+more messages and triggered you again with @claude. Trust frame unchanged: \
+helpful within reason, no Steve private info."""
+
+
+def build_resume_prompt(
+    *,
+    requester_name: str,
+    requester_is_owner: bool,
+    new_messages: Iterable[HistMsg],
+    latest_text: str,
+) -> str:
+    """Lightweight prompt for an existing Claude session being resumed.
+
+    The session already holds the full history, trust framing, and any
+    memory-index entities pulled by the prior turn — re-sending all of
+    that wastes tokens against the cache. We just hand it the new
+    messages plus a short reminder.
+    """
+    framing = (
+        _RESUME_TRUST_OWNER
+        if requester_is_owner
+        else _RESUME_TRUST_NON_OWNER.format(requester_name=requester_name)
+    )
+    new_history = _format_history(new_messages)
+    return f"""{framing}
+
+## New messages since the last turn (oldest first)
+{new_history}
+
+## The @claude trigger (most recent message)
+{latest_text}
+{_OUTPUT_RULES}
+"""
 
 
 def build_prompt(

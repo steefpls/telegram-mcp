@@ -14,8 +14,9 @@ from .messages import (
     random_signature,
     random_thinking,
 )
-from .prompt import HistMsg, build_prompt
+from .prompt import HistMsg, build_prompt, build_resume_prompt
 from .runner import run_claude
+from .store import ChatSessionStore, TrustedUserStore
 
 logger = logging.getLogger("telegram_mcp.claude_trigger")
 
@@ -71,16 +72,23 @@ async def _gather_history(
                 timestamp=ts,
                 text=text,
                 is_owner=is_owner,
+                id=m.id,
             )
         )
     out.reverse()  # oldest first
     return out
 
 
-def _build_event_handler(client, cfg: TriggerConfig, locks: ChatLockManager):
+def _build_event_handler(
+    client,
+    cfg: TriggerConfig,
+    locks: ChatLockManager,
+    sessions: ChatSessionStore,
+    trusted: TrustedUserStore,
+):
     async def handler(event):
         try:
-            await _maybe_dispatch(client, cfg, locks, event)
+            await _maybe_dispatch(client, cfg, locks, sessions, trusted, event)
         except Exception:
             logger.exception("Unhandled error in @claude event handler")
 
@@ -88,7 +96,12 @@ def _build_event_handler(client, cfg: TriggerConfig, locks: ChatLockManager):
 
 
 async def _maybe_dispatch(
-    client, cfg: TriggerConfig, locks: ChatLockManager, event
+    client,
+    cfg: TriggerConfig,
+    locks: ChatLockManager,
+    sessions: ChatSessionStore,
+    trusted: TrustedUserStore,
+    event,
 ) -> None:
     msg: Message = event.message
     text = msg.text or ""
@@ -102,10 +115,10 @@ async def _maybe_dispatch(
         return
 
     sender_id = msg.sender_id
-    if sender_id != cfg.owner_user_id:
-        # MVP: owner-only. Phase 2 adds trusted_users table.
+    is_owner = sender_id == cfg.owner_user_id
+    if not is_owner and not trusted.is_trusted(sender_id or 0):
         logger.info(
-            "Ignoring @claude from non-owner sender_id=%s (owner=%s)",
+            "Ignoring @claude from untrusted sender_id=%s (owner=%s)",
             sender_id,
             cfg.owner_user_id,
         )
@@ -114,11 +127,16 @@ async def _maybe_dispatch(
     chat_id = msg.chat_id
     lock = locks.get(chat_id)
     async with lock:
-        await _process_trigger(client, cfg, msg, chat_id, sender_id)
+        await _process_trigger(client, cfg, sessions, msg, chat_id, sender_id)
 
 
 async def _process_trigger(
-    client, cfg: TriggerConfig, msg: Message, chat_id: int, sender_id: int
+    client,
+    cfg: TriggerConfig,
+    sessions: ChatSessionStore,
+    msg: Message,
+    chat_id: int,
+    sender_id: int,
 ) -> None:
     # Send thinking ack as a reply to the trigger message
     try:
@@ -137,17 +155,49 @@ async def _process_trigger(
             "Steve" if requester_is_owner else await _resolve_sender_name(client, sender_id)
         )
 
-        prompt = build_prompt(
-            chat_name=chat_name,
-            requester_name=requester_name,
-            requester_is_owner=requester_is_owner,
-            messages=history,
-            latest_text=msg.text or "",
-            memory_vault=cfg.memory_vault,
+        # --- Resume vs new-session decision -----------------------------
+        # Resume only when: a session exists, isn't expired, AND there is
+        # no gap between the messages it has already seen and the oldest
+        # message in our current history slice (otherwise the session
+        # would be reasoning over a hole in the conversation).
+        existing = sessions.get(chat_id)
+        oldest_in_history = min((m.id for m in history), default=0)
+        can_resume = (
+            existing is not None
+            and oldest_in_history > 0
+            and oldest_in_history <= existing.newest_msg_id
         )
 
+        if can_resume:
+            # Strip messages the session already has, plus Claude's own
+            # outgoing replies (the session has them in its native form;
+            # re-sending the rendered text wastes tokens).
+            new_messages = [
+                m for m in history
+                if m.id > existing.newest_msg_id
+                and not (m.is_owner and is_claude_response(m.text))
+            ]
+            prompt = build_resume_prompt(
+                requester_name=requester_name,
+                requester_is_owner=requester_is_owner,
+                new_messages=new_messages,
+                latest_text=msg.text or "",
+            )
+            resume_session_id = existing.session_id
+        else:
+            prompt = build_prompt(
+                chat_name=chat_name,
+                requester_name=requester_name,
+                requester_is_owner=requester_is_owner,
+                messages=history,
+                latest_text=msg.text or "",
+                memory_vault=cfg.memory_vault,
+            )
+            resume_session_id = ""
+
         print(
-            f"[@claude] dispatch chat={chat_id} sender={sender_id} prompt_len={len(prompt)}",
+            f"[@claude] dispatch chat={chat_id} sender={sender_id} "
+            f"mode={'resume' if can_resume else 'new'} prompt_len={len(prompt)}",
             file=sys.stderr,
         )
 
@@ -159,6 +209,7 @@ async def _process_trigger(
             timeout_seconds=cfg.timeout_seconds,
             mcp_port=cfg.mcp_port,
             mcp_api_key=cfg.mcp_api_key,
+            resume_session_id=resume_session_id,
         )
 
         if result.success and result.text:
@@ -168,10 +219,23 @@ async def _process_trigger(
         else:
             response = f"⚠️ {result.error or 'Claude invocation failed'}"
 
+        if result.success and result.session_id:
+            newest_id = max((m.id for m in history), default=msg.id)
+            try:
+                sessions.save(
+                    chat_id=chat_id,
+                    session_id=result.session_id,
+                    newest_msg_id=newest_id,
+                    last_input_tokens=result.total_tokens,
+                    just_compacted=False,
+                )
+            except Exception:
+                logger.exception("Failed to persist chat session for chat_id=%s", chat_id)
+
         print(
             f"[@claude] result chat={chat_id} ok={result.success} "
-            f"tokens={result.total_tokens} cost=${result.cost_usd:.4f} "
-            f"len={len(result.text)}",
+            f"resumed={result.resumed} tokens={result.total_tokens} "
+            f"cost=${result.cost_usd:.4f} len={len(result.text)}",
             file=sys.stderr,
         )
 
@@ -193,17 +257,23 @@ async def _process_trigger(
             pass
 
 
-def register(client, cfg: TriggerConfig) -> None:
+def register(
+    client,
+    cfg: TriggerConfig,
+    sessions: ChatSessionStore,
+    trusted: TrustedUserStore,
+) -> None:
     """Wire @claude trigger handlers onto the Telethon client. Caller is
     responsible for running an HTTP transport (see configure_http_transport)."""
     locks = ChatLockManager()
-    handler = _build_event_handler(client, cfg, locks)
+    handler = _build_event_handler(client, cfg, locks, sessions, trusted)
     # incoming=None catches both incoming and outgoing — Steve can self-trigger.
     client.add_event_handler(handler, events.NewMessage(incoming=None))
     client.add_event_handler(handler, events.MessageEdited(incoming=None))
     print(
         f"[@claude] trigger registered (owner={cfg.owner_user_id}, "
-        f"port={cfg.mcp_port}, vault={cfg.memory_vault or 'none'})",
+        f"port={cfg.mcp_port}, vault={cfg.memory_vault or 'none'}, "
+        f"db={cfg.db_path})",
         file=sys.stderr,
     )
 
