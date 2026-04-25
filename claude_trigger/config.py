@@ -20,6 +20,10 @@ class TriggerConfig:
     history_messages: int
     db_path: str
     session_ttl_hours: int
+    compact_threshold_tokens: int
+    compact_model: str
+    compact_timeout_seconds: int
+    compact_max_budget_usd: str
 
     @classmethod
     def from_env(cls) -> Optional["TriggerConfig"]:
@@ -51,4 +55,14 @@ class TriggerConfig:
             history_messages=int(os.getenv("CLAUDE_HISTORY_MESSAGES", "40")),
             db_path=os.getenv("CLAUDE_TRIGGER_DB_PATH", "data/telegram_mcp.db").strip(),
             session_ttl_hours=int(os.getenv("CLAUDE_SESSION_TTL_HOURS", "24")),
+            compact_threshold_tokens=int(
+                os.getenv("CLAUDE_COMPACT_THRESHOLD_TOKENS", "120000")
+            ),
+            compact_model=os.getenv("CLAUDE_COMPACT_MODEL", "haiku").strip(),
+            compact_timeout_seconds=int(
+                os.getenv("CLAUDE_COMPACT_TIMEOUT_SECONDS", "180")
+            ),
+            compact_max_budget_usd=os.getenv(
+                "CLAUDE_COMPACT_MAX_BUDGET_USD", "0.50"
+            ).strip(),
         )

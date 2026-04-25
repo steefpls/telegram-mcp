@@ -14,7 +14,13 @@ from .messages import (
     random_signature,
     random_thinking,
 )
-from .prompt import HistMsg, build_prompt, build_resume_prompt
+from .prompt import (
+    HistMsg,
+    build_compaction_summary_prompt,
+    build_post_compact_prompt,
+    build_prompt,
+    build_resume_prompt,
+)
 from .runner import run_claude
 from .store import ChatSessionStore, TrustedUserStore
 
@@ -155,7 +161,7 @@ async def _process_trigger(
             "Steve" if requester_is_owner else await _resolve_sender_name(client, sender_id)
         )
 
-        # --- Resume vs new-session decision -----------------------------
+        # --- Resume vs new-session vs compact decision ------------------
         # Resume only when: a session exists, isn't expired, AND there is
         # no gap between the messages it has already seen and the oldest
         # message in our current history slice (otherwise the session
@@ -168,7 +174,92 @@ async def _process_trigger(
             and oldest_in_history <= existing.newest_msg_id
         )
 
-        if can_resume:
+        # Compaction fires when the resumable session is approaching the
+        # context window. We require can_resume because there is nothing to
+        # compact otherwise (a fresh session has no prior context to summarize),
+        # and we gate on `just_compacted` so two compactions never run
+        # back-to-back (the post-compact turn itself can be heavy).
+        should_compact = (
+            can_resume
+            and cfg.compact_threshold_tokens > 0
+            and existing is not None
+            and existing.last_input_tokens >= cfg.compact_threshold_tokens
+            and not existing.just_compacted
+        )
+
+        compacted_now = False
+        if should_compact:
+            assert existing is not None  # mypy/sanity — guaranteed by should_compact
+            try:
+                await client.edit_message(
+                    chat_id, ack.id, "🗜️ compacting context..."
+                )
+            except Exception:
+                logger.exception("Failed to edit ack to compacting state")
+
+            print(
+                f"[@claude] compacting chat={chat_id} prior_tokens={existing.last_input_tokens} "
+                f"threshold={cfg.compact_threshold_tokens} session={existing.session_id}",
+                file=sys.stderr,
+            )
+
+            summary_result = await run_claude(
+                build_compaction_summary_prompt(),
+                claude_path=cfg.claude_path,
+                model=cfg.compact_model,
+                max_budget_usd=cfg.compact_max_budget_usd,
+                timeout_seconds=cfg.compact_timeout_seconds,
+                mcp_port=cfg.mcp_port,
+                mcp_api_key=cfg.mcp_api_key,
+                resume_session_id=existing.session_id,
+            )
+
+            print(
+                f"[@claude] compact-summary chat={chat_id} ok={summary_result.success} "
+                f"tokens={summary_result.total_tokens} cost=${summary_result.cost_usd:.4f} "
+                f"len={len(summary_result.text)}",
+                file=sys.stderr,
+            )
+
+            if summary_result.success and summary_result.text.strip():
+                # Build the post-compact prompt for a brand new session.
+                prompt = build_post_compact_prompt(
+                    chat_name=chat_name,
+                    requester_name=requester_name,
+                    requester_is_owner=requester_is_owner,
+                    summary=summary_result.text,
+                    messages=history,
+                    latest_text=msg.text or "",
+                    memory_vault=cfg.memory_vault,
+                )
+                resume_session_id = ""  # fresh session
+                compacted_now = True
+                mode = "compact"
+            else:
+                # Summary failed — fall back to a normal fresh session. The
+                # prior session may itself be broken; trying to resume it
+                # again here would just hit the same wall.
+                logger.warning(
+                    "Compaction summary failed (chat_id=%s err=%r); falling back to fresh session",
+                    chat_id,
+                    summary_result.error,
+                )
+                prompt = build_prompt(
+                    chat_name=chat_name,
+                    requester_name=requester_name,
+                    requester_is_owner=requester_is_owner,
+                    messages=history,
+                    latest_text=msg.text or "",
+                    memory_vault=cfg.memory_vault,
+                )
+                resume_session_id = ""
+                # Mark as "compacted" anyway so we don't re-attempt the
+                # failing summary on every subsequent turn — operator can
+                # clear the flag manually or wait for the next normal turn.
+                compacted_now = True
+                mode = "compact-fallback"
+        elif can_resume:
+            assert existing is not None
             # Strip messages the session already has, plus Claude's own
             # outgoing replies (the session has them in its native form;
             # re-sending the rendered text wastes tokens).
@@ -184,6 +275,7 @@ async def _process_trigger(
                 latest_text=msg.text or "",
             )
             resume_session_id = existing.session_id
+            mode = "resume"
         else:
             prompt = build_prompt(
                 chat_name=chat_name,
@@ -194,10 +286,11 @@ async def _process_trigger(
                 memory_vault=cfg.memory_vault,
             )
             resume_session_id = ""
+            mode = "new"
 
         print(
             f"[@claude] dispatch chat={chat_id} sender={sender_id} "
-            f"mode={'resume' if can_resume else 'new'} prompt_len={len(prompt)}",
+            f"mode={mode} prompt_len={len(prompt)}",
             file=sys.stderr,
         )
 
@@ -227,14 +320,19 @@ async def _process_trigger(
                     session_id=result.session_id,
                     newest_msg_id=newest_id,
                     last_input_tokens=result.total_tokens,
-                    just_compacted=False,
+                    # On the turn we just compacted on, set the gate so the
+                    # very next turn can't trigger a second compaction even
+                    # if it lands above the threshold. Any subsequent turn
+                    # clears the gate (just_compacted=False) and the normal
+                    # threshold check resumes.
+                    just_compacted=compacted_now,
                 )
             except Exception:
                 logger.exception("Failed to persist chat session for chat_id=%s", chat_id)
 
         print(
             f"[@claude] result chat={chat_id} ok={result.success} "
-            f"resumed={result.resumed} tokens={result.total_tokens} "
+            f"mode={mode} resumed={result.resumed} tokens={result.total_tokens} "
             f"cost=${result.cost_usd:.4f} len={len(result.text)}",
             file=sys.stderr,
         )

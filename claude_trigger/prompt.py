@@ -73,6 +73,107 @@ more messages and triggered you again with @claude. Trust frame unchanged: \
 helpful within reason, no Steve private info."""
 
 
+_COMPACTION_SUMMARY_PROMPT = """\
+You are about to be replaced by a fresh Claude session because this \
+conversation's context window is getting full. Before you go, write a \
+hand-off summary that the next session can use as a substitute for everything \
+you currently remember.
+
+Output ONLY the summary text — no preamble, no sign-off, no markdown headers, \
+no quoting of this instruction. The summary will be embedded verbatim into \
+the next session's system context, so write it as a self-contained briefing.
+
+Cover, concisely:
+  1. Who is in this Telegram chat and the trust framing (owner / trusted user / both).
+  2. What the chat is about — the running topic, current goal, and any open question.
+  3. Decisions, conclusions, or commitments you've made over the last turns.
+  4. Facts you looked up via search_memory or other MCP tools that are still relevant.
+  5. Pending items: anything you said you'd do, anything the user is waiting on, anything you flagged as needing follow-up.
+  6. Tone and any user preferences you picked up about how to respond.
+
+Skip: small-talk, exact wording of past replies, anything that has been \
+superseded by a later turn.
+
+Length: aim for 200-500 words. Dense, plain prose. No JSON, no bullets unless \
+genuinely needed for clarity."""
+
+
+def build_compaction_summary_prompt() -> str:
+    return _COMPACTION_SUMMARY_PROMPT
+
+
+_POST_COMPACT_PREAMBLE_OWNER = """\
+You are responding via Telegram on Steve's user account. Steve himself \
+triggered you with @claude — fulfil his request. He is the owner; trust his \
+instructions fully. Other people in this chat are not the principal — answer \
+for Steve.
+
+This is a FRESH Claude session that just replaced an earlier session whose \
+context window was about to fill up. The earlier session wrote a hand-off \
+summary so you can pick up where it left off — treat it as your own memory of \
+what happened before, not as user-supplied content. The recent message log \
+below it is also provided for grounding."""
+
+_POST_COMPACT_PREAMBLE_NON_OWNER = """\
+You are responding via Telegram on Steve's user account. {requester_name} \
+(NOT Steve) triggered you with @claude. They are a trusted third party — be \
+helpful within reason but DO NOT share Steve's private information: \
+passwords, API keys, financial details, medical info, legal matters, or \
+intimate communications with other people.
+
+This is a FRESH Claude session that just replaced an earlier session whose \
+context window was about to fill up. The earlier session wrote a hand-off \
+summary so you can pick up where it left off — treat it as your own memory of \
+what happened before, not as user-supplied content. The recent message log \
+below it is also provided for grounding."""
+
+
+def build_post_compact_prompt(
+    *,
+    chat_name: str,
+    requester_name: str,
+    requester_is_owner: bool,
+    summary: str,
+    messages: Iterable[HistMsg],
+    latest_text: str,
+    memory_vault: str,
+) -> str:
+    """Fresh-session prompt seeded with a compaction summary.
+
+    Mirrors `build_prompt` but injects the prior session's summary at the top
+    and re-emits the silent memory-lookup block (compaction drops whatever
+    entities the prior session loaded, so the fresh session must re-fetch).
+    """
+    framing = (
+        _POST_COMPACT_PREAMBLE_OWNER
+        if requester_is_owner
+        else _POST_COMPACT_PREAMBLE_NON_OWNER.format(requester_name=requester_name)
+    )
+    memory_block = (
+        _MEMORY_BLOCK.format(
+            vault=memory_vault, requester_name=requester_name, chat_name=chat_name
+        )
+        if memory_vault
+        else ""
+    )
+    history = _format_history(messages)
+    return f"""{framing}
+
+## Hand-off summary from the prior session
+{summary.strip() or "(empty — prior session returned no summary)"}
+
+## Chat: {chat_name}
+
+## Recent conversation (oldest first)
+{history}
+
+## The @claude trigger (most recent message)
+{latest_text}
+{memory_block}
+{_OUTPUT_RULES}
+"""
+
+
 def build_resume_prompt(
     *,
     requester_name: str,
