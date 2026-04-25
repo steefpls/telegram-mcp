@@ -14,7 +14,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-import nest_asyncio
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
@@ -96,7 +95,7 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-mcp = FastMCP("telegram")
+mcp = FastMCP("telegram-mcp")
 
 if SESSION_STRING:
     # Use the string session if available
@@ -4762,12 +4761,42 @@ async def _main() -> None:
 
         # Warm entity cache — StringSession has no persistent cache,
         # so fetch all dialogs once to populate it
-        print("Warming entity cache...")
+        print("Warming entity cache...", file=sys.stderr)
         await client.get_dialogs()
 
-        print("Telegram client started. Running MCP server...")
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        # Transport selection: when CLAUDE_TRIGGER_ENABLED=true, run as a
+        # long-lived HTTP daemon (matches whatsapp-mcp's deployment model — no
+        # parent stdio process required, survives Claude Code restarts, watches
+        # incoming Telegram messages 24/7 for @claude mentions). Otherwise fall
+        # back to the legacy stdio mode for back-compat with existing
+        # ~/.claude.json configs that spawn this script as a stdio child.
+        trigger_cfg = None
+        try:
+            from claude_trigger import TriggerConfig
+
+            trigger_cfg = TriggerConfig.from_env()
+        except Exception as trigger_err:
+            print(
+                f"WARNING: trigger config invalid ({trigger_err}); falling back to stdio.",
+                file=sys.stderr,
+            )
+
+        if trigger_cfg is not None:
+            from claude_trigger import configure_http_transport, register as register_trigger
+
+            register_trigger(client, trigger_cfg)
+            configure_http_transport(mcp, trigger_cfg)
+            print(
+                "Telegram MCP daemon ready (HTTP + @claude trigger).",
+                file=sys.stderr,
+            )
+            await mcp.run_streamable_http_async()
+        else:
+            print(
+                "Telegram client started. Running MCP server (stdio)...",
+                file=sys.stderr,
+            )
+            await mcp.run_stdio_async()
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -4776,11 +4805,20 @@ async def _main() -> None:
                 file=sys.stderr,
             )
         sys.exit(1)
+    finally:
+        # Telethon spawns background coroutines (network reader, keepalive,
+        # update dispatcher) that keep the asyncio loop alive forever unless
+        # we explicitly disconnect. Without this, the process becomes a zombie
+        # when stdin EOFs (parent Claude Code instance closes).
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
 
 
 def main() -> None:
     _configure_allowed_roots_from_cli(sys.argv[1:])
-    nest_asyncio.apply()
     asyncio.run(_main())
 
 
