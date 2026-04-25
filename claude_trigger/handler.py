@@ -21,8 +21,13 @@ from .prompt import (
     build_prompt,
     build_resume_prompt,
 )
-from .runner import run_claude
+from .runner import ClaudeResult, run_claude
 from .store import ChatSessionStore, TrustedUserStore
+
+# Fallback retry pause between attempt 2 (fresh after resume failure) and
+# attempt 3 (sleep+retry fresh). Short enough that the user doesn't notice;
+# long enough to ride out a transient stdio/anyio hiccup or rate-limit nudge.
+_FALLBACK_RETRY_DELAY_SECONDS = 2.0
 
 logger = logging.getLogger("telegram_mcp.claude_trigger")
 
@@ -136,6 +141,79 @@ async def _maybe_dispatch(
         await _process_trigger(client, cfg, sessions, msg, chat_id, sender_id)
 
 
+async def _run_with_fallback(
+    cfg: TriggerConfig,
+    *,
+    chat_id: int,
+    primary_prompt: str,
+    primary_resume_session_id: str,
+    fallback_prompt: str,
+) -> ClaudeResult:
+    """Three-attempt invocation chain.
+
+    1. Primary call (resume or fresh, as decided upstream).
+    2. If primary was a resume AND failed, retry once with a fresh session
+       and the full `fallback_prompt` (the resumed session may itself be
+       broken on Claude's end — a fresh session bypasses it).
+    3. If still failing, sleep briefly and retry fresh once more to ride
+       out transient issues (stdio hiccups, rate-limit nudges, anyio
+       stream resets from the FastMCP HTTP transport).
+
+    Returns the final ClaudeResult — caller handles the error message edit
+    on failure exactly like before.
+    """
+    result = await run_claude(
+        primary_prompt,
+        claude_path=cfg.claude_path,
+        model=cfg.claude_model,
+        max_budget_usd=cfg.max_budget_usd,
+        timeout_seconds=cfg.timeout_seconds,
+        mcp_port=cfg.mcp_port,
+        mcp_api_key=cfg.mcp_api_key,
+        resume_session_id=primary_resume_session_id,
+    )
+    if result.success:
+        return result
+
+    if primary_resume_session_id:
+        print(
+            f"[CLAUDE] Fallback 2/3 (chat {chat_id}): resume "
+            f"{primary_resume_session_id} failed ({result.error!r}), "
+            f"retrying as fresh session",
+            file=sys.stderr,
+        )
+        result = await run_claude(
+            fallback_prompt,
+            claude_path=cfg.claude_path,
+            model=cfg.claude_model,
+            max_budget_usd=cfg.max_budget_usd,
+            timeout_seconds=cfg.timeout_seconds,
+            mcp_port=cfg.mcp_port,
+            mcp_api_key=cfg.mcp_api_key,
+            resume_session_id="",
+        )
+        if result.success:
+            return result
+
+    print(
+        f"[CLAUDE] Fallback 3/3 (chat {chat_id}): retrying fresh after "
+        f"{_FALLBACK_RETRY_DELAY_SECONDS}s sleep ({result.error!r})",
+        file=sys.stderr,
+    )
+    await asyncio.sleep(_FALLBACK_RETRY_DELAY_SECONDS)
+    result = await run_claude(
+        fallback_prompt,
+        claude_path=cfg.claude_path,
+        model=cfg.claude_model,
+        max_budget_usd=cfg.max_budget_usd,
+        timeout_seconds=cfg.timeout_seconds,
+        mcp_port=cfg.mcp_port,
+        mcp_api_key=cfg.mcp_api_key,
+        resume_session_id="",
+    )
+    return result
+
+
 async def _process_trigger(
     client,
     cfg: TriggerConfig,
@@ -195,6 +273,18 @@ async def _process_trigger(
                 file=sys.stderr,
             )
         should_compact = threshold_met and existing is not None and not existing.just_compacted
+
+        # Always build the full new-session prompt so the fallback chain can
+        # retry as fresh if a resume or post-compact attempt fails. Cheap —
+        # build_prompt is pure string assembly over `history`.
+        fresh_prompt = build_prompt(
+            chat_name=chat_name,
+            requester_name=requester_name,
+            requester_is_owner=requester_is_owner,
+            messages=history,
+            latest_text=msg.text or "",
+            memory_vault=cfg.memory_vault,
+        )
 
         compacted_now = False
         if should_compact:
@@ -259,14 +349,7 @@ async def _process_trigger(
                     f"back to fresh session without summary: {summary_result.error!r}",
                     file=sys.stderr,
                 )
-                prompt = build_prompt(
-                    chat_name=chat_name,
-                    requester_name=requester_name,
-                    requester_is_owner=requester_is_owner,
-                    messages=history,
-                    latest_text=msg.text or "",
-                    memory_vault=cfg.memory_vault,
-                )
+                prompt = fresh_prompt
                 resume_session_id = ""
                 # Mark as "compacted" anyway so we don't re-attempt the
                 # failing summary on every subsequent turn — operator can
@@ -296,14 +379,7 @@ async def _process_trigger(
                 file=sys.stderr,
             )
         else:
-            prompt = build_prompt(
-                chat_name=chat_name,
-                requester_name=requester_name,
-                requester_is_owner=requester_is_owner,
-                messages=history,
-                latest_text=msg.text or "",
-                memory_vault=cfg.memory_vault,
-            )
+            prompt = fresh_prompt
             resume_session_id = ""
             print(
                 f"[CLAUDE] New session for chat {chat_id} "
@@ -311,20 +387,17 @@ async def _process_trigger(
                 file=sys.stderr,
             )
 
-        result = await run_claude(
-            prompt,
-            claude_path=cfg.claude_path,
-            model=cfg.claude_model,
-            max_budget_usd=cfg.max_budget_usd,
-            timeout_seconds=cfg.timeout_seconds,
-            mcp_port=cfg.mcp_port,
-            mcp_api_key=cfg.mcp_api_key,
-            resume_session_id=resume_session_id,
+        result = await _run_with_fallback(
+            cfg,
+            chat_id=chat_id,
+            primary_prompt=prompt,
+            primary_resume_session_id=resume_session_id,
+            fallback_prompt=fresh_prompt,
         )
 
         if not result.success:
             print(
-                f"[CLAUDE] CLI failed for chat {chat_id} "
+                f"[CLAUDE] CLI failed after fallback chain for chat {chat_id} "
                 f"(session={result.session_id}, resume={result.resumed}): "
                 f"{result.error}",
                 file=sys.stderr,
