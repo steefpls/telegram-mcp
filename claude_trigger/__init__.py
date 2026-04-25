@@ -7,7 +7,14 @@ context, edits a thinking-message ack in-place with the response.
 from .config import TriggerConfig
 from .handler import configure_http_transport, register
 from .mcp_tools import register_mcp_tools, register_media_resource
-from .store import ChatSessionStore, MediaStore, TrustedUserStore, open_database
+from .store import (
+    ChatSessionStore,
+    MediaStore,
+    MessageStore,
+    ReactionCacheStore,
+    TrustedUserStore,
+    open_database,
+)
 
 __all__ = [
     "TriggerConfig",
@@ -17,6 +24,8 @@ __all__ = [
     "register_media_resource",
     "ChatSessionStore",
     "MediaStore",
+    "MessageStore",
+    "ReactionCacheStore",
     "TrustedUserStore",
     "open_database",
 ]

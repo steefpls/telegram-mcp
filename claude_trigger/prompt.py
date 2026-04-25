@@ -38,6 +38,9 @@ class HistMsg:
     reply_preview: tuple[str, str] | None = None
     # Attached media descriptor; None for plain text messages.
     media: MediaInfo | None = None
+    # Prior text versions, oldest-first. Empty list when the message hasn't
+    # been edited (or edit history is disabled at the config layer).
+    edit_history: list[str] = field(default_factory=list)
 
 
 _OWNER_FRAMING = """\
@@ -140,6 +143,18 @@ def _format_history(messages: Iterable[HistMsg]) -> str:
         lines.append(f"[{ts}] {sender}: {text}")
         if m.media:
             lines.append(_format_media(m.media))
+        if m.edit_history:
+            # One prior version: "✏️ originally: \"...\""
+            # Multiple: "✏️ edits: \"v1\" → \"v2\" → current"
+            if len(m.edit_history) == 1:
+                lines.append(
+                    f'        ✏️ originally: "{_truncate(m.edit_history[0], _QUOTE_PREVIEW_LIMIT)}"'
+                )
+            else:
+                chain = " → ".join(
+                    f'"{_truncate(t, _QUOTE_PREVIEW_LIMIT)}"' for t in m.edit_history
+                )
+                lines.append(f"        ✏️ edits: {chain} → current")
         if m.reactions:
             inline = " · ".join(f"{emoji} {who}" for emoji, who in m.reactions)
             lines.append(f"        💬 {inline}")

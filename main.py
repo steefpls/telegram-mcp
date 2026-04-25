@@ -4785,6 +4785,8 @@ async def _main() -> None:
             from claude_trigger import (
                 ChatSessionStore,
                 MediaStore,
+                MessageStore,
+                ReactionCacheStore,
                 TrustedUserStore,
                 configure_http_transport,
                 open_database,
@@ -4798,9 +4800,14 @@ async def _main() -> None:
             sessions = ChatSessionStore(db, ttl_hours=trigger_cfg.session_ttl_hours)
             trusted = TrustedUserStore(db)
             media_store = MediaStore(db)
+            message_store = MessageStore(db)
+            reaction_cache = ReactionCacheStore(db)
             os.makedirs(trigger_cfg.media_dir, exist_ok=True)
 
-            register_trigger(client, trigger_cfg, sessions, trusted, media_store, mcp=mcp)
+            register_trigger(
+                client, trigger_cfg, sessions, trusted, media_store,
+                message_store, reaction_cache, mcp=mcp,
+            )
             register_mcp_tools(mcp, trusted)
             register_media_resource(mcp, media_store)
             # Re-register concrete FileResources for media downloaded by a

@@ -26,7 +26,13 @@ from .prompt import (
     build_resume_prompt,
 )
 from .runner import ClaudeResult, run_claude
-from .store import ChatSessionStore, MediaStore, TrustedUserStore
+from .store import (
+    ChatSessionStore,
+    MediaStore,
+    MessageStore,
+    ReactionCacheStore,
+    TrustedUserStore,
+)
 
 # Fallback retry pause between attempt 2 (fresh after resume failure) and
 # attempt 3 (sleep+retry fresh). Short enough that the user doesn't notice;
@@ -72,6 +78,10 @@ async def _gather_history(
     limit: int,
     owner_id: int,
     media_store: MediaStore | None = None,
+    message_store: MessageStore | None = None,
+    reaction_cache: ReactionCacheStore | None = None,
+    reaction_cache_ttl: int = 0,
+    show_edit_history: bool = True,
 ) -> list[HistMsg]:
     raw: list[Message] = []
     async for m in client.iter_messages(chat_id, limit=limit):
@@ -126,12 +136,33 @@ async def _gather_history(
                 file=sys.stderr,
             )
 
-    # --- Per-message reactor lookups (parallel) ---
+    # --- Per-message reactor lookups (cache-first) ---
+    # Cache hit path: read (emoji, user_id) pairs from reactions_cache, no
+    # API call. Cache miss / stale: fire GetMessageReactionsListRequest,
+    # store the result. Drops typical per-trigger reaction-list API call
+    # count from len(history-with-reactions) to ~0 in steady state.
     async def fetch_reactions_for(m: Message) -> list[tuple[str, str]]:
         if not getattr(m, "reactions", None):
             return []
-        # Rich path: resolve each reactor's name. limit=20 is plenty for
-        # group chats — beyond that we render a count instead.
+
+        cache_hit = (
+            reaction_cache is not None
+            and reaction_cache.is_fresh(chat_id, m.id, reaction_cache_ttl)
+        )
+        if cache_hit:
+            pairs = reaction_cache.get_cached_pairs(chat_id, m.id)
+            grouped: dict[str, list[int]] = {}
+            for emoji, uid in pairs:
+                grouped.setdefault(emoji, []).append(uid)
+            unique_uids = {u for uids in grouped.values() for u in uids}
+            for uid in unique_uids:
+                await name_for(uid)
+            return [
+                (emoji, ", ".join(name_cache[uid] for uid in uids))
+                for emoji, uids in grouped.items()
+            ]
+
+        # Cache miss / stale — fall back to live API.
         try:
             res = await client(
                 GetMessageReactionsListRequest(peer=chat_id, id=m.id, limit=20)
@@ -139,11 +170,26 @@ async def _gather_history(
         except Exception:
             res = None
         if res is not None and getattr(res, "reactions", None):
-            grouped: dict[str, list[int]] = {}
+            grouped = {}
             for pr in res.reactions:
                 emoji = getattr(pr.reaction, "emoticon", None) or "?"
                 uid = getattr(pr.peer_id, "user_id", None) or 0
                 grouped.setdefault(emoji, []).append(uid)
+            # Persist into cache so the next trigger inside the TTL skips the API.
+            if reaction_cache is not None:
+                pairs = [
+                    (emoji, uid)
+                    for emoji, uids in grouped.items()
+                    for uid in uids
+                ]
+                try:
+                    reaction_cache.replace(
+                        chat_id=chat_id, message_id=m.id, pairs=pairs
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist reaction cache for msg=%s", m.id
+                    )
             unique_uids = {u for uids in grouped.values() for u in uids}
             for uid in unique_uids:
                 await name_for(uid)
@@ -180,6 +226,14 @@ async def _gather_history(
                 status=rec.status,
             )
 
+    # Bulk-fetch edit history for the slice in one query.
+    edits_by_msg_id: dict[int, list[str]] = {}
+    if message_store is not None and show_edit_history:
+        slice_ids = [m.id for m in raw]
+        edits_map = message_store.get_edits_for_slice(chat_id, slice_ids)
+        for mid, edits in edits_map.items():
+            edits_by_msg_id[mid] = [e.prior_text for e in edits]
+
     out: list[HistMsg] = []
     for m, reactions in zip(raw, react_lists):
         if isinstance(reactions, BaseException) or reactions is None:
@@ -211,6 +265,7 @@ async def _gather_history(
                 reactions=reactions,
                 reply_preview=reply_preview,
                 media=media_by_msg_id.get(m.id),
+                edit_history=edits_by_msg_id.get(m.id, []),
             )
         )
     out.reverse()  # oldest first
@@ -224,6 +279,8 @@ def _build_event_handler(
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
     media: MediaStore | None,
+    messages: MessageStore | None,
+    reactions: ReactionCacheStore | None,
     mcp=None,
 ):
     async def handler(event):
@@ -237,8 +294,42 @@ def _build_event_handler(
                 schedule_download(client, msg, cfg=cfg, store=media, mcp=mcp)
             except Exception:
                 logger.exception("Failed to schedule media download")
+        # Persist message text and log edits. Telethon delivers both
+        # NewMessage and MessageEdited as the same event shape; we
+        # disambiguate by event class name.
+        if msg is not None and messages is not None:
+            try:
+                # Telethon names both event classes "Event" — the discriminator
+                # lives in __qualname__: "NewMessage.Event" vs "MessageEdited.Event".
+                evt_qualname = type(event).__qualname__
+                text = msg.text or ""
+                if text and not is_thinking_message(text):
+                    if "MessageEdited" in evt_qualname:
+                        # On edit, log a revision (only if text actually
+                        # changed — reaction-only events go through this
+                        # path too) and invalidate the reaction cache so
+                        # the next trigger re-fetches.
+                        messages.record_edit(
+                            chat_id=msg.chat_id,
+                            message_id=msg.id,
+                            sender_id=msg.sender_id or 0,
+                            new_text=text,
+                        )
+                        if reactions is not None:
+                            reactions.invalidate(msg.chat_id, msg.id)
+                    else:
+                        messages.record_initial(
+                            chat_id=msg.chat_id,
+                            message_id=msg.id,
+                            sender_id=msg.sender_id or 0,
+                            text=text,
+                        )
+            except Exception:
+                logger.exception("Failed to persist message / edit")
         try:
-            await _maybe_dispatch(client, cfg, locks, sessions, trusted, media, event)
+            await _maybe_dispatch(
+                client, cfg, locks, sessions, trusted, media, messages, reactions, event
+            )
         except Exception:
             logger.exception("Unhandled error in @claude event handler")
 
@@ -252,6 +343,8 @@ async def _maybe_dispatch(
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
     media: MediaStore | None,
+    messages: MessageStore | None,
+    reactions: ReactionCacheStore | None,
     event,
 ) -> None:
     msg: Message = event.message
@@ -278,7 +371,10 @@ async def _maybe_dispatch(
     chat_id = msg.chat_id
     lock = locks.get(chat_id)
     async with lock:
-        await _process_trigger(client, cfg, sessions, media, msg, chat_id, sender_id)
+        await _process_trigger(
+            client, cfg, sessions, media, messages, reactions,
+            msg, chat_id, sender_id,
+        )
 
 
 async def _run_with_fallback(
@@ -359,6 +455,8 @@ async def _process_trigger(
     cfg: TriggerConfig,
     sessions: ChatSessionStore,
     media: MediaStore | None,
+    messages: MessageStore | None,
+    reactions: ReactionCacheStore | None,
     msg: Message,
     chat_id: int,
     sender_id: int,
@@ -372,10 +470,17 @@ async def _process_trigger(
         return
 
     try:
+        gather_kwargs = dict(
+            media_store=media,
+            message_store=messages,
+            reaction_cache=reactions,
+            reaction_cache_ttl=cfg.reaction_cache_ttl_seconds,
+            show_edit_history=cfg.show_edit_history,
+        )
         # First pass: gather history without waiting for media (cheap), so we
         # know which message_ids in the slice carry attachments.
         history = await _gather_history(
-            client, chat_id, cfg.history_messages, cfg.owner_user_id, media
+            client, chat_id, cfg.history_messages, cfg.owner_user_id, **gather_kwargs
         )
 
         # Wait briefly for any in-flight downloads in the slice. This lets a
@@ -400,7 +505,8 @@ async def _process_trigger(
                 )
                 # Re-gather so HistMsg.media reflects the latest statuses.
                 history = await _gather_history(
-                    client, chat_id, cfg.history_messages, cfg.owner_user_id, media
+                    client, chat_id, cfg.history_messages, cfg.owner_user_id,
+                    **gather_kwargs,
                 )
 
         chat_name = await _resolve_chat_name(client, chat_id)
@@ -636,6 +742,8 @@ def register(
     sessions: ChatSessionStore,
     trusted: TrustedUserStore,
     media: MediaStore | None = None,
+    messages: MessageStore | None = None,
+    reactions: ReactionCacheStore | None = None,
     mcp=None,
 ) -> None:
     """Wire @claude trigger handlers onto the Telethon client. Caller is
@@ -645,7 +753,9 @@ def register(
     mime_type (so spawned Claude can render images / play audio natively
     instead of getting opaque octet-stream blobs)."""
     locks = ChatLockManager()
-    handler = _build_event_handler(client, cfg, locks, sessions, trusted, media, mcp)
+    handler = _build_event_handler(
+        client, cfg, locks, sessions, trusted, media, messages, reactions, mcp
+    )
     # incoming=None catches both incoming and outgoing — Steve can self-trigger.
     client.add_event_handler(handler, events.NewMessage(incoming=None))
     client.add_event_handler(handler, events.MessageEdited(incoming=None))
@@ -656,10 +766,17 @@ def register(
         if (media is not None and cfg.media_auto_download_enabled)
         else "off"
     )
+    edits_state = "on" if (messages is not None and cfg.show_edit_history) else "off"
+    rxc_state = (
+        f"on (ttl={cfg.reaction_cache_ttl_seconds}s)"
+        if reactions is not None and cfg.reaction_cache_ttl_seconds > 0
+        else "off"
+    )
     print(
         f"[CLAUDE] Trigger registered (owner={cfg.owner_user_id}, "
         f"port={cfg.mcp_port}, vault={cfg.memory_vault or 'none'}, "
-        f"db={cfg.db_path}, media={media_state})",
+        f"db={cfg.db_path}, media={media_state}, edits={edits_state}, "
+        f"reaction_cache={rxc_state})",
         file=sys.stderr,
     )
 

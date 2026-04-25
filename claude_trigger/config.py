@@ -57,6 +57,8 @@ class TriggerConfig:
     media_types: frozenset[str] = field(default_factory=frozenset)
     media_dir: str = "data/media"
     media_wait_timeout_seconds: float = 10.0
+    show_edit_history: bool = True
+    reaction_cache_ttl_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> Optional["TriggerConfig"]:
@@ -114,5 +116,21 @@ class TriggerConfig:
             # voice notes; oversized docs should already be `skipped`.
             media_wait_timeout_seconds=float(
                 os.getenv("MEDIA_WAIT_TIMEOUT_SECONDS", "10")
+            ),
+            # Default ON — Steve enabled this knowing the privacy trade-off.
+            # Surfaces "originally said X, edited to Y" in the prompt so the
+            # model has the full conversational signal that Telegram's bare
+            # "(edited)" marker only hints at. Disable in shared chats where
+            # other participants edit and reasonably expect the prior text
+            # to stay private.
+            show_edit_history=_truthy(
+                os.getenv("CLAUDE_SHOW_EDIT_HISTORY"), default=True
+            ),
+            # Per-message reaction-list TTL. 5 minutes is conservative —
+            # most reactions arrive in a burst right after the message and
+            # stabilize quickly. Longer TTL = fewer API calls; shorter =
+            # faster surfacing of late reactions.
+            reaction_cache_ttl_seconds=int(
+                os.getenv("CLAUDE_REACTION_CACHE_TTL_SECONDS", "300")
             ),
         )
